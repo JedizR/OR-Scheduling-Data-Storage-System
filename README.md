@@ -168,8 +168,182 @@ uv run jupyter lab
 | `01_schema_and_orm.ipynb` | Req 1 & 2 — Schema & ORM | 16 SQLAlchemy model classes, `create_all()`, GIST constraint verification |
 | `02_seed_data.ipynb` | Req 3 — Seeding | `seed_database()` with idempotency check |
 | `03_atomic_operations.ipynb` | Req 4 — Atomic Operations | 5 operations end-to-end with full audit trail |
-| `04_performance_test.ipynb` | Req 5 — Performance Testing | 10,000 create_case @ 612 TPS; concurrent booking with 20 threads |
-| `05_isolation_test.ipynb` | Req 6 — Isolation Testing | 50 threads race for one room slot — exactly 1 succeeds |
+| `04_performance_test.ipynb` | Req 5 — Performance Testing | 10,000 create_case @ 681 TPS; 500 concurrent appointments @ 183 TPS, 500/500 successes |
+| `05_isolation_test.ipynb` | Req 6 — Isolation Testing | Naive demo proves data corruption; 50 threads race with SELECT FOR UPDATE — exactly 1 succeeds; GIST constraint independently verified |
+
+---
+
+## System Flow per Notebook
+
+### NB01 — Schema & ORM Setup
+
+```
+Import 16 SQLAlchemy model classes
+        │
+        ▼
+Base.metadata.create_all(engine)
+  └─ Creates all 16 tables, GIST constraint, indexes, triggers
+        │
+        ▼
+Query INFORMATION_SCHEMA.tables
+  └─ Verify all 16 tables exist in PostgreSQL
+        │
+        ▼
+Query pg_constraint WHERE conrelid = 'room_reservations'
+  └─ Verify GIST exclusion constraint (no_room_overlap, contype='x') present
+        │
+        ▼
+Display ORM column definitions per model (type, nullable, PK, FK)
+```
+
+### NB02 — Initial Data Population
+
+```
+seed_database()  ← First call
+  ├─ INSERT 5 departments
+  ├─ INSERT 8 rooms (OR-1..OR-6, Hybrid-OR, Emergency-OR)
+  ├─ INSERT 6 equipment units
+  ├─ INSERT 20 staff (5 surgeons, 5 anaests, 5 scrub nurses, 5 coords)
+  ├─ INSERT 100 patients (HN-00000001..HN-00000100)
+  └─ INSERT ~476 room + staff schedules (14-day window)
+        │
+        ▼
+Query row counts for all tables → display summary
+        │
+        ▼
+seed_database()  ← Second call (idempotency check)
+  └─ All inserts use get-or-create → zero duplicates
+        │
+        ▼
+SELECT COUNT(*) FROM patients WHERE hn LIKE 'HN-%'
+  └─ Assert = 100  ✅
+```
+
+### NB03 — Atomic Business Operations
+
+```
+CLEANUP CELL (idempotent, runs every time)
+  DELETE override_displaced_appointments → overrides → audit_log
+  DELETE equipment_reservations → staff_reservations → room_reservations
+  DELETE appointments → cases
+        │
+        ▼
+Op 1: create_case(patient_hn, dept, surgeon, procedure)
+  └─ INSERT cases → AuditLog[CREATED]
+        │
+        ▼
+Op 2a: create_appointment(case, room=OR-3, 08:00–10:00, staff×3, equip×1)
+  ├─ Lock room row (SELECT FOR UPDATE)
+  ├─ Check RoomSchedule, StaffSchedule covers window
+  ├─ INSERT appointment[CONFIRMED]
+  ├─ INSERT room_reservation, staff_reservations×3, equipment_reservation
+  └─ AuditLog[CONFIRMED]
+        │
+Op 2b: create_appointment(same room, same time)  →  RoomConflictError ✓
+        │
+        ▼
+Op 3: cancel_appointment(appt_id)
+  ├─ UPDATE appointment.status → CANCELLED, version 1→2
+  ├─ UPDATE all reservations.status → RELEASED
+  └─ AuditLog[CANCELLED]
+        │
+        ▼
+Op 4: emergency_override(elective_appt, emergency_case, auth_code)
+  ├─ UPDATE elective appointment.status → BUMPED
+  ├─ INSERT override record + override_displaced_appointments
+  ├─ INSERT emergency appointment[CONFIRMED] (same room/time as elective)
+  └─ AuditLog[BUMPED, CONFIRMED]
+        │
+        ▼
+Op 5: complete_appointment(appt_id, actual_end_time=now)
+  ├─ UPDATE appointment.status → COMPLETED
+  ├─ UPDATE equipment_reservation.status → STERILIZING
+  │    sterilization_end = actual_end_time + sterilization_duration_min
+  └─ AuditLog[COMPLETED]
+        │
+        ▼
+Display last 20 audit_log entries
+```
+
+### NB04 — Performance Testing
+
+```
+SETUP
+  Load dept, rooms (×6 OR), all surgeons (×5), all anaesthesiologists (×5)
+        │
+        ▼
+TEST 1: create_case() × 10,000
+  Pre-seed 10,000 PERF-XXXXXXXX patients (if not already present)
+  Load patient HNs
+  Loop 100 batches × 100 cases:
+    SessionLocal → create_case() × 100 → commit
+    Record batch latency
+  Measure: total time, TPS, P50/P95/P99 latency
+        │
+        ▼
+TEST 2: concurrent create_appointment() × 500
+  IDEMPOTENCY CLEANUP: delete prior reservations for OR-1..OR-5, today+7..today+35
+  Pre-create 500 fresh cases
+  Build 500 booking slots:
+    room_idx = slot_i % 5           → unique room per slot group
+    surgeon = surgeon_ids[room_idx] → unique surgeon per room (no cross-room conflict)
+    anaest  = anaest_ids[room_idx]  → unique anaesthesiologist per room
+    time    = 08:00 + (slot_in_day × 2h), date = today + 7..N days
+  Ensure RoomSchedule + StaffSchedule exist for all future dates
+  ThreadPoolExecutor(20 workers):
+    Each thread: create_appointment(slot) → commit → 'success'
+                 RoomConflictError        → 'conflict'
+                 Any other exception      → 'error'
+  Measure: successes, conflicts, errors, TPS
+```
+
+### NB05 — Isolation Testing (Concurrency)
+
+```
+SETUP
+  ISOLATION_DATE = today + 30 days  (fresh date)
+  IDEMPOTENCY CLEANUP: delete prior reservations for OR-1 on ISOLATION_DATE
+  Load OR-1, 1 surgeon, 1 anaesthesiologist
+  Ensure RoomSchedule + StaffSchedule exist for ISOLATION_DATE
+  Pre-create 50 cases (one per thread)
+        │
+        ▼
+TEST 1 PART A: Naive Check-Then-Insert (Problem Case — No Locking)
+  CREATE TABLE naive_bookings (no constraints — no GIST, no UNIQUE)
+  threading.Barrier(10) → 10 threads start simultaneously
+  Each thread:
+    SELECT COUNT(*) FROM naive_bookings  ← room appears free (no lock)
+    sleep(20ms)                          ← widen race window
+    INSERT INTO naive_bookings           ← all succeed with no constraint to block them
+  Result: 10 rows, all with identical booked_from/booked_until → DATA CORRUPTION ✅
+  DROP TABLE naive_bookings (cleanup)
+        │
+        ▼
+TEST 1 PART B: SELECT FOR UPDATE (Solution Case)
+  threading.Barrier(50) → all 50 threads held until all are ready
+  Release simultaneously:
+    Each thread calls create_appointment(OR-1, 08:00–10:00)
+      └─ SELECT room FOR UPDATE (PostgreSQL row lock)
+           Thread-1: acquires lock → INSERT reservation → COMMIT → SUCCESS
+           Threads 2–50: blocked until Thread-1 commits
+                         → re-reads: reservation exists → RoomConflictError
+  DB verification: SELECT actual row from room_reservations → exactly 1 row shown
+  Assert: successes=1, conflicts=49, errors=0, db_reservations=1  ✅
+        │
+        ▼
+TEST 2: GIST Constraint Safety Net
+  Raw SQL INSERT (bypasses all application logic):
+    appointment_id = gen_random_uuid()  ← fresh UUID bypasses UNIQUE constraint
+    room_id        = OR-1 room_id       ← same room
+    time range     = 08:00–10:00        ← overlaps existing reservation
+  PostgreSQL evaluates GIST: tstzrange overlaps → IntegrityError:
+    "conflicting key value violates exclusion constraint no_room_overlap"  ✅
+        │
+        ▼
+Summary: two independent layers proven:
+  Layer 1 (Application) → SELECT FOR UPDATE serializes concurrent transactions
+  Layer 2 (Database)    → GIST exclusion constraint rejects invalid INSERTs
+```
 
 ---
 
@@ -210,26 +384,37 @@ Tested on PostgreSQL 16 (Docker), Python 3.10, macOS.
 
 | Metric | Result |
 |---|---|
-| Throughput | **612 TPS** |
-| P50 latency | 1.39 ms |
-| P95 latency | 2.77 ms |
-| P99 latency | 3.57 ms |
+| Throughput | **681 TPS** |
+| P50 latency | 1.370 ms |
+| P95 latency | 2.259 ms |
+| P99 latency | 2.596 ms |
 
-**Test 2 — concurrent `create_appointment()`, 500 attempts, 20 workers**
+**Test 2 — concurrent `create_appointment()`, 500 attempts, 20 workers, 5 OR rooms**
 
 | Metric | Result |
 |---|---|
-| Successes | 84 |
-| Room conflicts (`RoomConflictError`) | 0 |
-| Staff conflicts (misclassified as "errors") | 416 |
+| Successes | **500** |
+| Conflicts (`RoomConflictError`) | 0 |
+| Errors (unexpected) | 0 |
+| Throughput (successful) | **183 TPS** |
+| P50 latency | 101.5 ms |
+| P95 latency | 188.9 ms |
 
-> The 416 "errors" are `StaffNotAvailableError` — the test assigns the same surgeon and anaesthesiologist to all 500 slots, making simultaneous bookings across 6 rooms correctly impossible. The system is correct; only the test's outcome classification is misleading. See `TEST_REPORT.md §4` for a full explanation and fix.
+Each room is assigned a unique surgeon+anaesthesiologist pair, eliminating staff conflicts so all 500 slots succeed.
 
 ---
 
 ## Concurrency Results
 
-**NB05 — 50 threads racing for the same room and time slot**
+**NB05 Test 1A — Naive check-then-insert (no locking): data corruption proven**
+
+| Check | Result |
+|---|---|
+| Threads that inserted | 10 |
+| Rows in `naive_bookings` for same slot | **10** (all identical time range) |
+| Data corruption | ✅ Confirmed — race condition is real |
+
+**NB05 Test 1B — SELECT FOR UPDATE: 50 threads racing for one slot**
 
 | Check | Result |
 |---|---|
@@ -239,7 +424,14 @@ Tested on PostgreSQL 16 (Docker), Python 3.10, macOS.
 | DB reservations after race | 1 |
 | Total race duration | 275.7 ms |
 
-`SELECT FOR UPDATE` serialised all 50 threads correctly — no double-booking occurred.
+**NB05 Test 2 — GIST constraint: raw SQL bypass rejected**
+
+| Check | Result |
+|---|---|
+| Constraint fired | `no_room_overlap` (GIST exclusion) |
+| Error | `conflicting key value violates exclusion constraint "no_room_overlap"` |
+
+Two independent protection layers verified: `SELECT FOR UPDATE` (application) and GIST exclusion (database).
 
 ---
 
@@ -291,11 +483,9 @@ docker-compose up -d       # restart if stopped
 docker-compose logs db     # inspect errors
 ```
 
-**NB03/NB05 fails because of stale reservations from a prior run**
+**NB03/NB04/NB05 fail because of stale reservations from a prior run**
 
-NB03 has an idempotent cleanup cell at the start — re-running it will clear all transactional data automatically. For NB05, change `ISOLATION_DATE` to a future date not previously used, or manually delete the conflicting reservation:
-```sql
-DELETE FROM room_reservations
-WHERE room_id = (SELECT room_id FROM rooms WHERE room_code = 'OR-1')
-  AND reservation_start::date = '<your ISOLATION_DATE>';
-```
+All three notebooks are fully idempotent — each has a cleanup step that deletes prior test reservations before running. Simply re-run the notebook from the top:
+- **NB03**: cleanup cell at the start deletes all transactional data (cases, appointments, reservations, audit_log)
+- **NB04**: `test_concurrent_booking_performance()` clears prior reservations for OR-1..OR-5 on `today+7..today+35` before booking
+- **NB05**: setup cell clears prior reservations for OR-1 on `ISOLATION_DATE` before creating test cases
