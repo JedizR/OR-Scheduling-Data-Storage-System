@@ -9,11 +9,11 @@
 
 | Notebook | Assignment Requirement | Status | Notes |
 |---|---|---|---|
-| `01_schema_and_orm.ipynb` | Requirements 1 & 2 — Schema & ORM | ✅ PASS | All 16 tables, GIST constraint verified |
+| `01_schema_and_orm.ipynb` | Requirements 1 & 2 — Schema & ORM | ✅ PASS | 16 tables, GIST constraint verified |
 | `02_seed_data.ipynb` | Requirement 3 — Seeding | ✅ PASS | Idempotency confirmed |
-| `03_atomic_operations.ipynb` | Requirement 4 — Atomic Operations | ✅ PASS | All 5 operations + audit log |
-| `04_performance_test.ipynb` | Requirement 5 — Performance Testing | ⚠️ PASS WITH ANOMALY | 612 TPS on create_case; 416 "errors" in appointment test are staff conflicts (see §4) |
-| `05_isolation_test.ipynb` | Requirement 6 — Isolation Testing | ⚠️ PASS WITH NOTE | Race condition correct; GIST test caught by wrong constraint (see §5) |
+| `03_atomic_operations.ipynb` | Requirement 4 — Atomic Operations | ✅ PASS | All 5 ops + atomicity rollback demo + audit log |
+| `04_performance_test.ipynb` | Requirement 5 — Performance Testing | ✅ PASS | 681 TPS on create_case; 500/500 concurrent appointments |
+| `05_isolation_test.ipynb` | Requirement 6 — Isolation Testing | ✅ PASS | Race condition + GIST constraint both proven with DB-level evidence |
 
 ---
 
@@ -63,13 +63,13 @@ None. All outputs are correct.
 | Idempotency | No duplicates on re-run | Confirmed — seed HN-% count = 100 after second run | ✅ |
 
 ### Row Counts at Time of Test
-These reflect a **post-NB04** database state (NB04 performance test runs after NB02 in the file order but may run before if notebooks are executed out of order):
+These reflect a **post-NB04** database state (NB04 performance test adds PERF-patients and cases):
 
 | Table | Count | Normal? |
 |---|---|---|
 | patients | 10,000 | ⚠️ NB04 pre-seeds PERF-XXXXXXXX patients |
 | cases | 10,555 | ⚠️ NB04 creates 10,000 + NB03/NB05 create ~55 cases |
-| appointments | 89 | ⚠️ Residual from prior test runs — NB03 cleanup only clears today+5 |
+| appointments | 89 | ⚠️ Residual from prior test runs |
 | overrides | 1 | Expected (from NB03 emergency override demo) |
 | audit_log | 10,647 | Expected (NB04 creates audit entries for each case) |
 
@@ -77,9 +77,7 @@ These reflect a **post-NB04** database state (NB04 performance test runs after N
 
 ### Anomalies
 
-**Non-blocking anomaly**: The row counts cell reflects cumulative state from all prior notebook runs rather than a fresh seed state. The "patients: 10,000" and "cases: 10,555" rows will raise questions during review but are expected given that NB04 pre-seeds 10,000 patients for its performance test. These rows are from performance/isolation tests, not from the seed itself.
-
-**Idempotency check was fixed**: The assertion was changed from `assert patient_count == 100` (total patients) to `assert seed_patient_count == 100` (only `HN-%` patients) to correctly ignore the PERF-patients added by NB04.
+**Non-blocking:** Row counts reflect cumulative cross-notebook state. The `patients: 10,000` and `cases: 10,555` rows are expected — they are PERF-prefixed rows from NB04, not duplicated seed data. The idempotency assertion correctly scopes to `HN-%` prefix only.
 
 ### Assignment Requirement Coverage
 - ✅ **Req 3**: `seed_database()` function inserts realistic batch data. Idempotent.
@@ -89,22 +87,26 @@ These reflect a **post-NB04** database state (NB04 performance test runs after N
 ## NB03 — Atomic Business Operations
 
 ### What ran
-All 5 operations demonstrated end-to-end with a full audit trail:
+All 5 operations demonstrated end-to-end with a full audit trail, plus an atomicity rollback problem-case demonstration:
 
-| Operation | Result |
-|---|---|
-| Op 1: `create_case()` | OPEN case created |
-| Op 2: `create_appointment()` — happy path | CONFIRMED, 3 staff reservations, 1 equipment reservation, 1 room reservation |
-| Op 2: double-booking attempt | `RoomConflictError` raised correctly |
-| Op 3: `cancel_appointment()` | Status → CANCELLED, version 1 → 2 |
-| Op 4: `emergency_override()` | Elective appointment → BUMPED, emergency created |
-| Op 5: `complete_appointment()` | Status → COMPLETED, equipment → STERILIZING |
+| Step | What was demonstrated | Result |
+|---|---|---|
+| Atomicity problem case | `create_appointment()` with invalid staff UUID — forces mid-operation failure | `StaffNotFoundError` raised; 0 appointments, 0 room_reservations in DB ✅ |
+| Op 1: `create_case()` | OPEN case created | ✅ |
+| Op 2a: `create_appointment()` — happy path | CONFIRMED, 3 staff reservations, 1 equipment reservation, 1 room reservation | ✅ |
+| Op 2b: Double-booking attempt | `RoomConflictError` raised; DB verification confirms exactly 1 reservation exists | ✅ |
+| Op 3: `cancel_appointment()` | Status → CANCELLED, version 1 → 2 | ✅ |
+| Op 4: `emergency_override()` | Elective appointment → BUMPED, emergency created | ✅ |
+| Op 5: `complete_appointment()` | Status → COMPLETED, equipment → STERILIZING | ✅ |
 
 ### Key Metrics
 
 | Check | Expected | Actual | Pass? |
 |---|---|---|---|
+| Atomicity rollback — appointments after failure | 0 | 0 | ✅ |
+| Atomicity rollback — room_reservations after failure | 0 | 0 | ✅ |
 | Double-booking prevented | `RoomConflictError` | Raised | ✅ |
+| Double-booking DB verification | 1 active reservation | 1 | ✅ |
 | Cancel sets status | `CANCELLED` | ✅ | ✅ |
 | Cancel increments version | 1 → 2 | ✅ | ✅ |
 | Emergency bumps elective | `BUMPED` | ✅ | ✅ |
@@ -113,14 +115,12 @@ All 5 operations demonstrated end-to-end with a full audit trail:
 
 ### Anomaly — Sterilization End Timestamp
 
-**Output:** `Sterilization ends at: 2026-03-04 01:37:01.617676+00:00`
-**Appointment scheduled for:** 2026-03-09
-**Observation:** The sterilization end is on 2026-03-04 (today), not 2026-03-09.
+**Output:** `Sterilization ends at: 2026-03-04 ...+00:00` (today, not appointment date 2026-03-09)
 
-**Root cause (not a bug):** `complete_appointment()` correctly uses the `actual_end_time` parameter, which in the notebook is set to `datetime.now(timezone.utc)`. The demo is completing the appointment immediately (for demonstration purposes) rather than waiting until the scheduled date. The system computes `sterilization_end = actual_end_time + sterilization_duration_min`, which is `now + 30 min`. This is correct system behaviour — sterilization begins when the equipment is physically returned, not at the scheduled end time.
+**Root cause (not a bug):** `complete_appointment()` uses `actual_end_time=datetime.now(timezone.utc)` in the demo. The system correctly computes `sterilization_end = actual_end_time + sterilization_duration_min` from the moment equipment is physically returned. This is correct system behaviour — the demo completes the appointment immediately rather than waiting until the scheduled date.
 
 ### Assignment Requirement Coverage
-- ✅ **Req 4**: 5 distinct atomic operations, at least one complex multi-table operation (`create_appointment` interacts with 6 tables), full commit/rollback demonstrated.
+- ✅ **Req 4**: 5 distinct atomic operations, at least one complex multi-table operation (`create_appointment` interacts with 6 tables), full commit/rollback demonstrated with DB-level evidence.
 
 ---
 
@@ -128,64 +128,66 @@ All 5 operations demonstrated end-to-end with a full audit trail:
 
 ### What ran
 - **Test 1:** 10,000 `create_case()` operations in batches of 100
-- **Test 2:** 500 `create_appointment()` attempts across 6 rooms with 20 concurrent workers
+- **Test 2:** 500 `create_appointment()` attempts across 5 OR rooms with 20 concurrent workers
 
 ### Test 1 Results — `create_case()` × 10,000
 
 | Metric | Value | Assessment |
 |---|---|---|
-| Total time | 16.33 s | Good |
-| **Throughput** | **612 TPS** | Excellent for OLTP |
-| P50 latency | 1.39 ms | Excellent |
-| P95 latency | 2.77 ms | Excellent |
-| P99 latency | 3.57 ms | Excellent |
-| Min latency | 1.25 ms | — |
-| Max latency | 3.57 ms | — |
+| Total time | 14.68 s | Excellent |
+| **Throughput** | **681 TPS** | Excellent for OLTP |
+| P50 latency | 1.370 ms | Excellent |
+| P95 latency | 2.259 ms | Excellent |
+| P99 latency | 2.596 ms | Excellent |
+| Min latency | 1.255 ms | — |
+| Max latency | 2.596 ms | — |
 
-> Industry benchmark: >100 TPS is generally considered adequate for hospital OLTP. 612 TPS demonstrates substantial headroom.
+> Industry benchmark: >100 TPS is generally considered adequate for hospital OLTP. 681 TPS demonstrates substantial headroom (6.8× the threshold).
 
 ### Test 2 Results — Concurrent `create_appointment()`
 
 | Metric | Value |
 |---|---|
+| OR Rooms used | 5 (unique surgeon+anaest pair per room) |
 | Attempts | 500 |
-| Successes | 84 |
-| Conflicts | **0** |
-| **Errors** | **416** |
-| Throughput (successful) | 61 TPS |
+| **Successes** | **500** |
+| Conflicts (room) | 0 |
+| Errors (unexpected) | 0 |
+| Total Time | 2.74 s |
+| **Throughput (successful)** | **183 TPS** |
+| P50 latency | 101.5 ms |
+| P95 latency | 188.9 ms |
+| P99 latency | 213.5 ms |
 
-### Critical Anomaly — 416 Errors in Test 2
+### Design — Unique Staff Per Room
 
-**Symptom:** 416 out of 500 booking attempts returned as `'error'` instead of either `'success'` or `'conflict'`.
+Each of the 5 OR rooms is assigned a dedicated surgeon+anaesthesiologist pair (`surgeon_ids[room_idx]`, `anaest_ids[room_idx]`). This eliminates `StaffNotAvailableError` from the results, ensuring all measured conflicts are room-level only and throughput reflects pure appointment booking performance.
 
-**Root cause:** The test pre-creates scheduling slots across 6 OR rooms, but assigns the **same `surgeon_id` and `anaest_id`** to every booking. When multiple rooms try to book the same staff member at the same time (e.g., OR-1 through OR-6 all at 08:00–10:00 on day 7), the second through sixth attempts raise `StaffNotAvailableError`.
-
-The `book_one()` function only catches `RoomConflictError`:
-```python
-except RoomConflictError:
-    return ('conflict', ...)
-except Exception as e:          # ← StaffNotAvailableError lands here
-    return ('error', str(e))
-```
-
-**Is the core system broken?** No. `StaffNotAvailableError` is the **correct** application-level response to a legitimate scheduling conflict. The booking test design inadvertently creates an impossible scenario: one surgeon and one anaesthesiologist cannot be in 6 different ORs simultaneously.
-
-**Impact:** The 416 "errors" are real scheduling conflicts caught by the application layer. The underlying OLTP operations are correct. Only the test's classification of outcomes is misleading (calling staff conflicts "errors" rather than "conflicts").
-
-**Recommendation:** Differentiate `StaffNotAvailableError` and `EquipmentNotAvailableError` as a separate `'staff_conflict'` outcome category, or assign distinct staff members per room to measure pure appointment booking throughput.
+### Anomalies
+None. 500/500 successes, 0 errors.
 
 ### Assignment Requirement Coverage
-- ✅ **Req 5**: Performance functions run operations thousands of times, reports total time and throughput (TPS). Meets the requirement.
+- ✅ **Req 5**: Performance functions run operations thousands of times, reports total time and throughput (TPS). Exceeds the requirement.
 
 ---
 
 ## NB05 — Isolation Testing (Concurrency)
 
 ### What ran
-- **Test 1:** 50 threads simultaneously attempt to book OR-1 at 08:00–10:00 on 2026-04-03
+- **Test 1 Part A:** 10 threads race to book OR-1 using naive check-then-insert (no lock) — proves data corruption occurs without protection
+- **Test 1 Part B:** 50 threads simultaneously attempt to book OR-1 using `SELECT FOR UPDATE`
 - **Test 2:** Raw SQL `INSERT` bypasses application logic to attempt a room double-booking
 
-### Test 1 Results — Race Condition
+### Test 1 Part A — Naive Booking (Problem Case)
+
+| Check | Expected | Actual | Pass? |
+|---|---|---|---|
+| Rows in `naive_bookings` for OR-1 | > 1 (data corruption) | **10** | ✅ |
+| All rows share same time slot | Yes | Yes — 10 overlapping entries | ✅ |
+
+10 threads all passed the "room is free" check simultaneously (no lock held during the 20ms sleep), then all inserted — producing 10 duplicate rows for the same OR-1 slot. This is the race condition in concrete, observable data.
+
+### Test 1 Part B — SELECT FOR UPDATE (Solution Case)
 
 | Check | Expected | Actual | Pass? |
 |---|---|---|---|
@@ -195,33 +197,23 @@ except Exception as e:          # ← StaffNotAvailableError lands here
 | Active reservations in DB | 1 | 1 | ✅ |
 | Total race duration | < 5,000 ms | 275.7 ms | ✅ |
 
-**All 4 assertions passed.** `SELECT FOR UPDATE` correctly serialised 50 concurrent threads with zero double-bookings.
+**All assertions passed.** `SELECT FOR UPDATE` correctly serialised 50 concurrent threads with zero double-bookings. DB query confirms exactly 1 row in `room_reservations` for OR-1 on the isolation date.
 
 ### Test 2 Results — GIST Constraint Safety Net
 
 | Check | Expected | Actual | Pass? |
 |---|---|---|---|
 | Raw INSERT rejected | Yes | Yes — `IntegrityError` raised | ✅ |
+| Constraint that fired | `no_room_overlap` (GIST) | `no_room_overlap` (GIST) | ✅ |
+| Error message | `conflicting key value violates exclusion constraint "no_room_overlap"` | Matches exactly | ✅ |
 
-### Anomaly — Wrong Constraint Fired in Test 2
+The raw INSERT used `gen_random_uuid()` for `appointment_id` (not the existing winning appointment's ID), so the UNIQUE constraint `uq_room_res_appt_room` was bypassed. The GIST exclusion constraint `no_room_overlap` was the sole mechanism that rejected the overlapping time range — proving database-level protection independent of application logic.
 
-**Output:** `Error: duplicate key value violates unique constraint "uq_room_res_appt_room"`
-**Expected:** GIST exclusion constraint `no_room_overlap` to fire.
-
-**Root cause:** The raw SQL `INSERT` in Test 2 reuses the **same `appointment_id`** as the existing reservation. PostgreSQL evaluates the `UNIQUE (appointment_id, room_id)` constraint before checking the GIST exclusion constraint. The unique constraint fires first and rejects the insert.
-
-**Is double-booking prevented?** Yes — the insert was rejected as required. But the mechanism demonstrated is the **unique key constraint**, not the **GIST exclusion constraint**.
-
-**To actually test the GIST constraint**, the INSERT must use:
-- A **different `appointment_id`** (a new UUID)
-- The **same `room_id`** and an **overlapping time range**
-
-The GIST constraint's purpose is to prevent two *different* appointments from overlapping in the same room. Using the same appointment ID tests a different invariant. The test result is still valid for demonstrating database-level defence, but the commentary "GIST exclusion constraint rejected the INSERT" is technically inaccurate.
-
-**Impact:** Cosmetic — the double-booking prevention outcome is correct and all assertions pass.
+### Anomalies
+None.
 
 ### Assignment Requirement Coverage
-- ✅ **Req 6**: Threading used to simulate simultaneous bookings, output proves database locks the row (1 success, 49 errors/rollbacks).
+- ✅ **Req 6**: Threading used to simulate simultaneous bookings. Output proves database row-level locking (1 success, 49 rollbacks). GIST constraint independently verified via raw SQL bypass. Exceeds requirement.
 
 ---
 
@@ -231,8 +223,8 @@ The GIST constraint's purpose is to prevent two *different* appointments from ov
 |---|---|---|---|---|
 | 1 | NB02 | Row counts show NB04-inflated patient/case totals (10,000/10,555) | Low | No — expected cross-notebook state |
 | 2 | NB03 | Sterilization end timestamp is today, not appointment date | Cosmetic | No — correct system behaviour, demo uses `now` as actual_end |
-| 3 | NB04 | 416 "errors" in concurrent booking = staff conflicts misclassified | Medium | No — system correct, test classification misleading |
-| 4 | NB05 | GIST test catches `uq_room_res_appt_room` unique constraint, not GIST | Cosmetic | No — double-booking is prevented; wrong constraint named |
+
+All previously reported anomalies (NB04 staff conflict errors, NB05 wrong constraint) have been resolved.
 
 ---
 
@@ -242,12 +234,12 @@ The GIST constraint's purpose is to prevent two *different* appointments from ov
 |---|---|---|---|
 | **Req 1 & 2** — Schema & ORM | Python classes, PKs, FKs, `create_all()` | 16 tables, full FK graph, `create_all()` | None |
 | **Req 3** — Seeding | 5 depts, 20 staff, 50 rooms, 100 patients | 5 depts, 20 staff, 8 rooms, 100 patients | Rooms: 8 vs example 50 (not a hard requirement) |
-| **Req 4** — Atomic Operations | 3–5 operations, at least one multi-table | 5 operations, all multi-table, full audit log | None |
-| **Req 5** — Performance Testing | Loop 10,000×, report time in seconds | 10,000 create_case @ 612 TPS; concurrent appointment test | None |
-| **Req 6** — Isolation Testing | Two threads, same room/time, prove one fails | 50 threads, 1 success, 49 `RoomConflictError`, DB verified | None — exceeds requirement |
+| **Req 4** — Atomic Operations | 3–5 operations, at least one multi-table | 5 operations, all multi-table, atomicity rollback proven, full audit log | None |
+| **Req 5** — Performance Testing | Loop 10,000×, report time in seconds | 10,000 create_case @ 681 TPS; 500 concurrent appointments @ 183 TPS | None |
+| **Req 6** — Isolation Testing | Two threads, same room/time, prove one fails | 50 threads (Part B), 1 success, 49 `RoomConflictError`, DB verified; naive demo (Part A) shows data corruption without locking; GIST independently verified | None — exceeds requirement |
 
 ---
 
 ## Final Verdict
 
-The system **meets all 6 assignment requirements**. The anomalies identified are non-blocking: two are cosmetic label issues, one is expected cross-notebook database state, and one is a test design limitation that does not affect the correctness of the core OLTP system. The underlying database operations — atomic transactions, row-level locking, GIST exclusion constraints, and audit logging — all function correctly.
+The system **meets all 6 assignment requirements** with zero blocking anomalies. The two remaining notes are cosmetic: cross-notebook patient count inflation (expected from performance test pre-seeding) and a sterilization timestamp that is intentionally set to `now` in the demo. The underlying database operations — atomic transactions, row-level locking, GIST exclusion constraints, and audit logging — all function correctly and are verified with direct database queries in every test.
