@@ -10,6 +10,8 @@ dependencies = [
     "faker",
     "rich",
     "python-dotenv",
+    "pymongo>=4.6",
+    "redis[hiredis]>=5.0",
 ]
 
 [project.optional-dependencies]

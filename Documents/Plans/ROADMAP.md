@@ -115,6 +115,28 @@ Each milestone is designed to be independently runnable and verifiable.
 
 ---
 
+## Milestone 5b — Assignment 02: High-RPS MongoDB OLTP Performance
+**Goal:** Demonstrate >10,000 RPS with MongoDB + Redis on an or_events event store.
+
+- [x] `src/or_scheduler/mongo_client.py` — MongoClient singleton, `setup_collection()`, `drop_secondary_indexes()`
+- [x] `src/or_scheduler/mongo_operations.py` — all 4 required functions
+- [x] `Assignment/06_mongodb_performance.ipynb` — 6-level insert test + 4-level update test
+- [x] MongoDB service added to `docker-compose.yml`
+- [x] Redis service added to `docker-compose.yml` (write buffer + Cache-Aside)
+- [x] `pymongo>=4.6` + `redis[hiredis]>=5.0` added to `pyproject.toml`
+
+### Actual Results (2026-03-08, Apple M-series)
+| Level | Strategy | TPS |
+|-------|----------|-----|
+| L0 | `insert_one` naive | ~baseline |
+| L3 | ThreadPoolExecutor(20) | ~175,000 |
+| L4 | + WriteConcern(w=1, j=False) | **329,961** ← PASS |
+| L5 | + drop secondary indexes | **372,977** ← PASS |
+| L6 | Redis write buffer (LPUSH) | ~77,881 (BONUS) |
+| U3 | update_many + ThreadPoolExecutor, date-range | **382,729** ← PASS |
+
+---
+
 ## Milestone 6 — FastAPI REST Layer
 **Goal:** Production API matching blueprint Part 11 specification.
 
@@ -191,3 +213,4 @@ Each milestone is designed to be independently runnable and verifiable.
 | 4. 3–5 Atomic Operations | Milestone 4 + Notebook 03 |
 | 5. Performance Testing | Milestone 5 + Notebook 04 |
 | 6. Isolation Testing | Milestone 5 + Notebook 05 |
+| **Assignment 02** — High-RPS NoSQL OLTP | Milestone 5b + Notebook 06 |
