@@ -105,7 +105,7 @@ departments
 
 ### Prerequisites
 
-- Docker Desktop (for PostgreSQL)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (runs PostgreSQL, MongoDB, and Redis)
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) package manager
 
@@ -113,7 +113,11 @@ departments
 
 ```bash
 cp .env.example .env
-# Edit .env — DATABASE_URL is pre-configured for the Docker container
+# .env.example is ready to use as-is — all three services are pre-configured:
+#   DATABASE_URL=postgresql://orscheduler:orscheduler@localhost:5432/orscheduler
+#   MONGODB_URI=mongodb://localhost:27017
+#   REDIS_HOST=localhost  /  REDIS_PORT=6379
+# Edit only if you need non-default ports.
 ```
 
 ### 2. Start all services
@@ -513,12 +517,31 @@ cd /path/to/OR-Scheduling-Data-Storage-System
 uv run jupyter nbconvert ...
 ```
 
-**"could not connect to server"**
+**"could not connect to server" (PostgreSQL)**
 ```bash
 docker-compose ps          # check container health
 docker-compose up -d       # restart if stopped
 docker-compose logs db     # inspect errors
 ```
+
+**"ServerSelectionTimeoutError" or "Connection refused" (MongoDB — NB06)**
+```bash
+docker-compose ps mongo            # confirm mongo container is running
+docker-compose up -d mongo         # start if stopped
+docker-compose logs mongo          # inspect errors
+# Verify: docker exec -it <container> mongosh --eval "db.adminCommand('ping')"
+```
+
+**"redis.exceptions.ConnectionError" (Redis — NB06 write-buffer test)**
+```bash
+docker-compose ps redis            # confirm redis container is running
+docker-compose up -d redis         # start if stopped
+docker-compose logs redis          # inspect errors
+```
+
+**NB06 runs without PostgreSQL**
+
+`06_mongodb_performance.ipynb` connects to MongoDB only. You do **not** need to run `init_db.py` or any NB01–NB05 step before running NB06.
 
 **NB03/NB04/NB05 fail because of stale reservations from a prior run**
 
