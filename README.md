@@ -20,6 +20,9 @@ The system manages the full lifecycle of surgical cases — from patient registr
 | Validation | pydantic-settings |
 | Data generation | Faker |
 | Output formatting | Rich |
+| Document store | MongoDB 7 (Docker) |
+| MongoDB driver | PyMongo 4.6 (synchronous) |
+| Cache / queue | Redis 7 (Docker) |
 
 ---
 
@@ -57,7 +60,11 @@ OR-Scheduling-Data-Storage-System/
 │   ├── 02_seed_data.ipynb
 │   ├── 03_atomic_operations.ipynb
 │   ├── 04_performance_test.ipynb
-│   └── 05_isolation_test.ipynb
+│   ├── 05_isolation_test.ipynb
+│   └── 06_mongodb_performance.ipynb  # Assignment 02
+├── src/or_scheduler/
+│   ├── mongo_client.py             # MongoClient singleton, indexes, WriteConcern
+│   └── mongo_operations.py         # insert_or_events, update_or_events + tests
 ├── docker-compose.yml
 ├── pyproject.toml
 ├── .env.example
@@ -109,11 +116,12 @@ cp .env.example .env
 # Edit .env — DATABASE_URL is pre-configured for the Docker container
 ```
 
-### 2. Start the database
+### 2. Start all services
 
 ```bash
 docker-compose up -d
-docker-compose ps   # wait until status shows "healthy"
+docker-compose ps   # wait until all services show "healthy"
+# Services: PostgreSQL 16 (port 5432), MongoDB 7 (port 27017), Redis 7 (port 6379)
 ```
 
 ### 3. Install dependencies
@@ -163,6 +171,8 @@ uv run jupyter lab
 
 ### Notebook summary
 
+#### Assignment 01 — PostgreSQL OLTP
+
 | Notebook | Assignment Requirement | What it demonstrates |
 |---|---|---|
 | `01_schema_and_orm.ipynb` | Req 1 & 2 — Schema & ORM | 16 SQLAlchemy model classes, `create_all()`, GIST constraint verification |
@@ -170,6 +180,14 @@ uv run jupyter lab
 | `03_atomic_operations.ipynb` | Req 4 — Atomic Operations | 5 operations end-to-end with full audit trail |
 | `04_performance_test.ipynb` | Req 5 — Performance Testing | 10,000 create_case @ 681 TPS; 500 concurrent appointments @ 183 TPS, 500/500 successes |
 | `05_isolation_test.ipynb` | Req 6 — Isolation Testing | Naive demo proves data corruption; 50 threads race with SELECT FOR UPDATE — exactly 1 succeeds; GIST constraint independently verified |
+
+#### Assignment 02 — MongoDB High-RPS OLTP
+
+Run NB06 independently — it connects to MongoDB, not PostgreSQL.
+
+| Notebook | Assignment Requirement | What it demonstrates |
+|---|---|---|
+| `06_mongodb_performance.ipynb` | Support >10,000 RPS with NoSQL | `insert_or_events` + `test_insert_performance` (50k docs, naive 3,818 TPS → optimised **240,740 TPS**); `update_or_events` + `test_update_performance` (5k docs, naive 4,018 TPS → optimised **315,503 TPS**) |
 
 ---
 
@@ -450,14 +468,33 @@ Two independent protection layers verified: `SELECT FOR UPDATE` (application) an
 
 ---
 
+## MongoDB High-RPS Results (Assignment 02)
+
+Tested on MongoDB 7.0.30 (Docker), PyMongo 4.16.0, Python 3.10.18, Apple M-series.
+
+| Test | Approach | Documents | TPS | Requirement |
+|------|----------|-----------|-----|-------------|
+| Insert | Naive (`insert_one` × N) | 50,000 | 3,818 | — |
+| Insert | Optimised | 50,000 | **240,740** | ✅ >10,000 |
+| Update | Naive (`update_one` × N) | 5,000 | 4,018 | — |
+| Update | Optimised | 5,000 | **315,503** | ✅ >10,000 |
+
+Insert optimised is **63× faster** than naive. Update optimised is **79× faster** than naive.
+
+See `Documents/Tests/TEST02_REPORT.md` for full details and `Documents/Tests/ASSIGNMENT02_TECHNIQUES.md` for technique explanations with code references.
+
+---
+
 ## Documentation
 
 | File | Description |
 |---|---|
-| `TEST_REPORT.md` | Full test results for all 5 notebooks — pass/fail table, anomaly analysis, completeness vs assignment requirements |
-| `TEST_TUTORIAL.md` | Per-notebook guide — configuration parameters, how to read the output, re-run safety notes, troubleshooting |
-| `OR_Scheduling_Blueprint.md` | Authoritative system design — 16 tables, 7 operations, full ER diagram |
-| `Assignment_Requirements.md` | Original 6 graded requirements from the assignment |
+| `Documents/Tests/TEST_REPORT.md` | Full test results for NB01–NB05 — pass/fail table, anomaly analysis |
+| `Documents/Tests/TEST02_REPORT.md` | Full test results for NB06 (MongoDB) — TPS results, technique breakdown |
+| `Documents/Tests/ASSIGNMENT02_TECHNIQUES.md` | Every optimisation technique explained with code file references |
+| `Documents/Tests/TEST_TUTORIAL.md` | Per-notebook guide — configuration, re-run safety, troubleshooting |
+| `Documents/Contexts/OR_Scheduling_Blueprint.md` | Authoritative system design — 16 tables, 7 operations, full ER diagram |
+| `Documents/Tests/Assignment_Requirements.md` | Original graded requirements |
 
 ---
 
