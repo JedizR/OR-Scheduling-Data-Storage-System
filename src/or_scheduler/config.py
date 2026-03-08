@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     pool_size: int = 20
     max_overflow: int = 10
     echo_sql: bool = False
+    mongodb_uri: str = "mongodb://localhost:27017"
+    redis_host: str = "localhost"
+    redis_port: int = 6379
 
     model_config = SettingsConfigDict(
         env_file=_env_file,
